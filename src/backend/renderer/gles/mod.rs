@@ -1473,6 +1473,9 @@ impl Bind<Dmabuf> for GlesRenderer {
     fn bind<'a>(&mut self, dmabuf: &'a mut Dmabuf) -> Result<GlesTarget<'a>, GlesError> {
         let mut bind = |dmabuf: &'a mut Dmabuf| {
             let texture = self.import_dmabuf(dmabuf, None)?;
+            if texture.0.is_external {
+                return Err(GlesError::FramebufferBindingError);
+            }
             self.bind_texture(&texture)
                 // SAFETY: The lifetime of the target only depends on the dmabuf,
                 // as the GlesTexture is cloned internally.
@@ -1627,7 +1630,13 @@ impl<'buffer> BlitFrame<GlesTarget<'buffer>> for GlesFrame<'_, '_> {
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
     ) -> Result<SyncPoint, Self::Error> {
+        unsafe {
+            self.renderer.gl.Disable(ffi::SCISSOR_TEST);
+        }
         let res = self.renderer.blit(self.target, to, src, dst, filter);
+        unsafe {
+            self.renderer.gl.Enable(ffi::SCISSOR_TEST);
+        }
         self.target
             .0
             .make_current(&self.renderer.gl, &self.renderer.egl)?;
