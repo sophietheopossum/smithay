@@ -353,9 +353,11 @@ pub struct GlesRenderer {
     // caches
     dmabuf_cache: HashMap<WeakDmabuf, GlesTexture>,
     vbos: [ffi::types::GLuint; 2],
+    texture_target_fbo: ffi::types::GLuint,
     vertices: Vec<f32>,
     non_opaque_damage: Vec<Rectangle<i32, Physical>>,
     opaque_damage: Vec<Rectangle<i32, Physical>>,
+    deferred_frame_flush_depth: usize,
 
     // markers
     _not_send: PhantomData<*mut ()>,
@@ -664,6 +666,8 @@ impl GlesRenderer {
             ffi::STATIC_DRAW,
         );
         gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+        let mut texture_target_fbo = 0;
+        gl.GenFramebuffers(1, &mut texture_target_fbo);
 
         context
             .user_data()
@@ -687,6 +691,7 @@ impl GlesRenderer {
             tex_program,
             solid_program,
             vbos,
+            texture_target_fbo,
             min_filter: TextureFilter::Linear,
             max_filter: TextureFilter::Linear,
 
@@ -694,6 +699,7 @@ impl GlesRenderer {
             vertices: Vec::with_capacity(6 * 16),
             non_opaque_damage: Vec::with_capacity(16),
             opaque_damage: Vec::with_capacity(16),
+            deferred_frame_flush_depth: 0,
 
             debug_flags: DebugFlags::empty(),
             _not_send: PhantomData,
@@ -1762,6 +1768,7 @@ impl Drop for GlesRenderer {
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
                 self.gl.DeleteProgram(self.solid_program.program);
                 self.gl.DeleteBuffers(self.vbos.len() as i32, self.vbos.as_ptr());
+                self.gl.DeleteFramebuffers(1, &self.texture_target_fbo);
 
                 self.profiler.cleanup(Some(&self.gl));
 
@@ -1813,6 +1820,172 @@ impl GlesRenderer {
             self.egl.make_current()?;
         }
         Ok(func(&self.gl))
+    }
+
+    /// Run offscreen rendering that will be consumed by subsequent commands
+    /// on this renderer without exporting a fence or flushing each temporary
+    /// frame individually.
+    pub fn with_deferred_frame_flushes<F, R>(&mut self, func: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        self.deferred_frame_flush_depth += 1;
+        let result = func(self);
+        self.deferred_frame_flush_depth -= 1;
+        result
+    }
+
+    /// Render a texture into another texture without creating and finishing
+    /// an intermediate [`GlesFrame`]. This is intended for texture processing
+    /// pipelines whose result is consumed by later commands on this renderer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_texture_to_texture(
+        &mut self,
+        source: &GlesTexture,
+        target: &GlesTexture,
+        src: Rectangle<f64, BufferCoord>,
+        program: Option<&GlesTexProgram>,
+        additional_uniforms: &[Uniform<'_>],
+    ) -> Result<(), GlesError> {
+        if Arc::ptr_eq(&source.0, &target.0) {
+            return Err(GlesError::FramebufferBindingError);
+        }
+
+        unsafe {
+            self.egl.make_current()?;
+        }
+
+        let texture_size = target.size();
+        let output_size = Size::<i32, Physical>::from((texture_size.w, texture_size.h));
+        let dest = Rectangle::<i32, Physical>::from_size(output_size);
+        if src.size.is_empty() || output_size.is_empty() {
+            return Ok(());
+        }
+
+        let mut target_sync = target.0.sync.write().unwrap();
+        let source_sync = source.0.sync.read().unwrap();
+        unsafe {
+            target_sync.wait_for_all(&self.gl);
+            source_sync.wait_for_upload(&self.gl);
+
+            self.gl.BindFramebuffer(ffi::FRAMEBUFFER, self.texture_target_fbo);
+            self.gl.FramebufferTexture2D(
+                ffi::FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                target.0.texture,
+                0,
+            );
+            if self.gl.CheckFramebufferStatus(ffi::FRAMEBUFFER) != ffi::FRAMEBUFFER_COMPLETE {
+                self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
+                return Err(GlesError::FramebufferBindingError);
+            }
+
+            self.gl.Viewport(0, 0, output_size.w, output_size.h);
+            self.gl.Disable(ffi::SCISSOR_TEST);
+            self.gl.Disable(ffi::BLEND);
+
+            let texture_target = if source.0.is_external {
+                ffi::TEXTURE_EXTERNAL_OES
+            } else {
+                ffi::TEXTURE_2D
+            };
+            let tex_program = program.unwrap_or(&self.tex_program);
+            let program_variant = tex_program.variant_for_format(source.0.format, source.0.has_alpha);
+            let program = if self.debug_flags.is_empty() {
+                &program_variant.normal
+            } else {
+                &program_variant.debug
+            };
+            let matrix = output_projection(output_size, Transform::Normal);
+            let mut tex_matrix = build_texture_mat(src, dest, source.size(), Transform::Normal);
+            if source.0.y_inverted {
+                tex_matrix = Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0) * tex_matrix;
+            }
+
+            self.gl.ActiveTexture(ffi::TEXTURE0);
+            self.gl.BindTexture(texture_target, source.0.texture);
+            self.gl.TexParameteri(
+                texture_target,
+                ffi::TEXTURE_MIN_FILTER,
+                match self.min_filter {
+                    TextureFilter::Nearest => ffi::NEAREST as i32,
+                    TextureFilter::Linear => ffi::LINEAR as i32,
+                },
+            );
+            self.gl.TexParameteri(
+                texture_target,
+                ffi::TEXTURE_MAG_FILTER,
+                match self.max_filter {
+                    TextureFilter::Nearest => ffi::NEAREST as i32,
+                    TextureFilter::Linear => ffi::LINEAR as i32,
+                },
+            );
+            self.gl.UseProgram(program.program);
+            self.gl.Uniform1i(program.uniform_tex, 0);
+            self.gl
+                .UniformMatrix3fv(program.uniform_matrix, 1, ffi::FALSE, matrix.as_ptr());
+            self.gl
+                .UniformMatrix3fv(program.uniform_tex_matrix, 1, ffi::FALSE, tex_matrix.as_ptr());
+            self.gl.Uniform1f(program.uniform_alpha, 1.0);
+            if !self.debug_flags.is_empty() {
+                let tint = if self.debug_flags.contains(DebugFlags::TINT) {
+                    1.0
+                } else {
+                    0.0
+                };
+                self.gl.Uniform1f(program_variant.uniform_tint, tint);
+            }
+            for uniform in additional_uniforms {
+                let desc = program
+                    .additional_uniforms
+                    .get(&*uniform.name)
+                    .ok_or_else(|| GlesError::UnknownUniform(uniform.name.clone().into_owned()))?;
+                uniform.value.set(&self.gl, desc)?;
+            }
+
+            self.gl.EnableVertexAttribArray(program.attrib_vert as u32);
+            self.gl.BindBuffer(ffi::ARRAY_BUFFER, self.vbos[0]);
+            self.gl.VertexAttribPointer(
+                program.attrib_vert as u32,
+                2,
+                ffi::FLOAT,
+                ffi::FALSE,
+                0,
+                std::ptr::null(),
+            );
+            self.gl
+                .DisableVertexAttribArray(program.attrib_vert_position as u32);
+            self.gl.VertexAttrib4f(
+                program.attrib_vert_position as u32,
+                0.0,
+                0.0,
+                output_size.w as f32,
+                output_size.h as f32,
+            );
+            if self.capabilities.contains(&Capability::Instancing) {
+                self.gl.VertexAttribDivisor(program.attrib_vert as u32, 0);
+                self.gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, 1);
+            } else {
+                self.gl.DrawArrays(ffi::TRIANGLES, 0, 6);
+            }
+
+            self.gl.BindTexture(texture_target, 0);
+            self.gl.DisableVertexAttribArray(program.attrib_vert as u32);
+            self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
+            self.gl.Enable(ffi::SCISSOR_TEST);
+            self.gl.Enable(ffi::BLEND);
+            self.gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
+
+            if self.capabilities.contains(&Capability::Fencing) {
+                source_sync.update_read(&self.gl);
+                target_sync.update_write(&self.gl);
+            } else if self.egl.is_shared() {
+                self.gl.Finish();
+            }
+        }
+
+        Ok(())
     }
 
     /// Run custom code in the GL context with GPU profiling.
@@ -2381,6 +2554,7 @@ impl GlesFrame<'_, '_> {
             return Ok(SyncPoint::signaled());
         }
 
+        let deferred = self.renderer.deferred_frame_flush_depth > 0;
         let finish_gpu_span = self
             .renderer
             .profiler
@@ -2407,6 +2581,12 @@ impl GlesFrame<'_, '_> {
         self.renderer.profiler.exit(&self.renderer.gl, finish_gpu_span);
         if let Some(span) = self.gpu_span.take() {
             self.renderer.profiler.exit(&self.renderer.gl, span);
+        }
+
+        if deferred {
+            // The result is consumed by later commands on the same context.
+            // Preserve command ordering without exporting a fence or flushing.
+            return Ok(SyncPoint::signaled());
         }
 
         // if we support egl fences we should use it
@@ -3111,6 +3291,30 @@ impl Drop for GlesFrame<'_, '_> {
             }
         }
     }
+}
+
+fn output_projection(output_size: Size<i32, Physical>, transform: Transform) -> Matrix3<f32> {
+    // replicate https://www.khronos.org/registry/OpenGL-Refpages/gl2.1/xhtml/glOrtho.xml
+    // glOrtho(0, width, 0, height, 1, 1);
+    let mut renderer = Matrix3::<f32>::identity();
+    let t = Matrix3::<f32>::identity();
+    let x = 2.0 / (output_size.w as f32);
+    let y = 2.0 / (output_size.h as f32);
+
+    // Rotation & Reflection
+    renderer[0][0] = x * t[0][0];
+    renderer[1][0] = x * t[0][1];
+    renderer[0][1] = y * -t[1][0];
+    renderer[1][1] = y * -t[1][1];
+
+    // Translation
+    renderer[2][0] = -(1.0f32.copysign(renderer[0][0] + renderer[1][0]));
+    renderer[2][1] = -(1.0f32.copysign(renderer[0][1] + renderer[1][1]));
+
+    // We account for OpenGL's coordinate system here.
+    let flip180 = Matrix3::new(1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0);
+
+    flip180 * transform.matrix() * renderer
 }
 
 fn build_texture_mat(
