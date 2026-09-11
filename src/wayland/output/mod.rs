@@ -216,6 +216,22 @@ impl Output {
         output.data::<OutputUserData>().and_then(|ud| ud.output.upgrade())
     }
 
+    /// Re-send `geometry` to every bound `wl_output`, then `done` to those of version 2 or later.
+    ///
+    /// For changes to properties that `wl_change_current_state` has no argument for.
+    pub(crate) fn wl_send_geometry(&self) {
+        let inner = self.inner.0.lock().unwrap();
+        for output in &inner.instances {
+            let Ok(output) = output.upgrade() else {
+                continue;
+            };
+            inner.send_geometry_to(&output);
+            if output.version() >= 2 {
+                output.done();
+            }
+        }
+    }
+
     pub(crate) fn wl_change_current_state(
         &self,
         new_mode: Option<Mode>,
