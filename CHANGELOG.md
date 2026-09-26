@@ -117,6 +117,9 @@ box minus the surface's frame extents.
 
 - ExtBackgroundEffect protocol is now available in `smithay::wayland::background_effect` module.
 
+- `Output::set_subpixel` changes the advertised subpixel layout after the output was created, and
+  sends the new `geometry` to every bound `wl_output` (followed by `done` from version 2 on).
+
 `crate::input::dnd` was introduced to enable implementation of Drag&Drop operations on custom types.
 Internally the same types and traits are used to implement `wayland::data_device` dnd-operations and XDND
 operations (see below).
