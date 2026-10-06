@@ -1123,6 +1123,10 @@ impl From<Transform> for DrmRotation {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "kept in upstream's position to avoid merge conflicts"
+)]
 mod test {
     use crate::{
         backend::drm::surface::atomic::to_fixed,

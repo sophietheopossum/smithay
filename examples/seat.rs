@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_macros,
+    reason = "this demo prints to the terminal and sets up no tracing subscriber"
+)]
+
 use std::sync::Arc;
 
 use smithay::backend::input::InputTime;

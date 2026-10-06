@@ -750,7 +750,7 @@ where
     }
 
     /// Returns whether the underlying driver supports immediate (async) page
-    /// flips — i.e. tearing flips. See [`DrmSurface::supports_async_page_flip`].
+    /// flips — i.e. tearing flips. See [`DrmSurface::supports_async_page_flip`][super::DrmSurface::supports_async_page_flip].
     pub fn supports_async_page_flip(&self) -> bool {
         self.with_compositor(|compositor| compositor.supports_async_page_flip())
     }

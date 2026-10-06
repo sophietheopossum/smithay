@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_macros,
+    reason = "this demo prints to the terminal and sets up no tracing subscriber"
+)]
+
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use smithay::reexports::drm::control::{connector, crtc};
