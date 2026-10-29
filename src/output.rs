@@ -407,6 +407,32 @@ impl Output {
         self.wl_change_current_state(new_mode, new_transform.map(Into::into), new_scale, new_location)
     }
 
+    /// Change the subpixel geometry advertised for this output
+    ///
+    /// Unlike the rest of the [`PhysicalProperties`] given to [`Output::new`], the subpixel layout
+    /// is often only known later: the kernel reports [`Subpixel::Unknown`] for many panels, and
+    /// the real arrangement then has to come from user configuration, which compositors
+    /// typically load after their outputs exist.
+    ///
+    /// The value is stored, so every `wl_output` bound afterwards receives it, and each currently
+    /// bound `wl_output` is sent a `geometry` event, followed by `done` from version 2 on. Setting
+    /// the value that is already advertised does nothing.
+    ///
+    /// Pass the physical arrangement of the panel's subpixels, not one adjusted for the output
+    /// transform, which is sent alongside it in the same `geometry` event.
+    pub fn set_subpixel(&self, subpixel: Subpixel) {
+        {
+            let mut inner = self.inner.0.lock().unwrap();
+            if inner.physical.subpixel == subpixel {
+                return;
+            }
+            inner.physical.subpixel = subpixel;
+        }
+
+        #[cfg(feature = "wayland_frontend")]
+        self.wl_send_geometry()
+    }
+
     /// Returns the user data of this output
     pub fn user_data(&self) -> &UserDataMap {
         &self.inner.1
@@ -556,3 +582,33 @@ impl TryFrom<OutputModeSource> for (Size<i32, Physical>, utils::Scale<f64>, Tran
 #[derive(Debug, thiserror::Error)]
 #[error("Output has no active mode")]
 pub struct OutputNoMode;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_subpixel_replaces_only_the_advertised_layout() {
+        let output = Output::new(
+            "test".into(),
+            PhysicalProperties {
+                size: (300, 200).into(),
+                subpixel: Subpixel::Unknown,
+                make: "make".into(),
+                model: "model".into(),
+                serial_number: "serial".into(),
+            },
+        );
+
+        output.set_subpixel(Subpixel::HorizontalRgb);
+        let physical = output.physical_properties();
+        assert_eq!(physical.subpixel, Subpixel::HorizontalRgb);
+        assert_eq!(physical.size, (300, 200).into());
+        assert_eq!(physical.make, "make");
+        assert_eq!(physical.model, "model");
+        assert_eq!(physical.serial_number, "serial");
+
+        output.set_subpixel(Subpixel::Unknown);
+        assert_eq!(output.physical_properties().subpixel, Subpixel::Unknown);
+    }
+}
